@@ -1,0 +1,464 @@
+description: |-
+  *Replace this default text with instructions or other information about your document.*  
+
+  ---
+  # commenting binaries download
+  # What is Markdown?
+  Markdown is a lightweight markup language that converts your content with plain text formatting to structurally valid rich text.
+  ## You can add headings
+  You can add *italics* or make the font **bold**.  
+  1. Create numbered lists 
+  * Add bullet points 
+  >Indent `code samples` 
+
+  You can create a [link to another webpage](${ AWS_ENDPOINT }).
+schemaVersion: '0.3'
+assumeRole: ''
+parameters:
+  InstanceId:
+    type: String
+  sqlversion:
+    type: String
+    allowedValues:
+      - sql2016
+      - sql2017
+      - sql2019
+      - sql2022
+  Backuprequired:
+    type: String
+    allowedValues:
+      - BackupRequired
+      - NoBackup
+    description: Backup is required to be taken as part of upgrade
+  backuplocation:
+    type: String
+    default: ''
+  S3BucketName:
+    type: String
+  AdminUserSecret:
+    type: String
+mainSteps:
+  - name: assertSSMAgentOnline
+    action: aws:assertAwsResourceProperty
+    nextStep: InstanceUpgrade
+    isEnd: false
+    inputs:
+      Service: ssm
+      Api: DescribeInstanceInformation
+      PropertySelector: $.InstanceInformationList[0].PingStatus
+      DesiredValues:
+        - Online
+      InstanceInformationFilterList:
+        - key: InstanceIds
+          valueSet:
+            - '{{ InstanceId }}'
+  - name: InstanceUpgrade
+    action: aws:runCommand
+    isEnd: true
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      Parameters:
+        executionTimeout: '1800'
+        commands:
+          - |
+            #Windows downgrade user secrets
+
+            $UserSecret = '{{AdminUserSecret}}'
+            #SQL Creds to run commands on SQL Server. Its recommended to use Windows Authentication
+            $SQLUsername =  Get-SECSecretValue -SecretId $UserSecret -Select SecretString | ConvertFrom-Json | Select -ExpandProperty username 
+            $SQLPwd= Get-SECSecretValue -SecretId $UserSecret -Select SecretString | ConvertFrom-Json | Select -ExpandProperty password
+            $SQLpassword = ConvertTo-SecureString $SQLpwd -AsPlainText -Force 
+            #Backup location where you want your backups to go
+            $backuplocation = '{{backuplocation}}'
+            #S3 location for SQL installation Media and ConfigurationFile
+            $S3BucketName = '{{S3BucketName}}'
+            #S3 location for SQL CU
+            #$S3CUBucketName = (Get-SSMParameterValue -Name S3CUBucketName).Parameters[0].Value 
+            $sqlversion = '{{sqlversion}}'
+            $backuprequired = '{{Backuprequired}}'
+            $timeStamp = Get-Date -format yyyy_MM_dd_HHmmss 
+            Write-HOST $SQLUsername
+            Write-HOST $backuplocation
+            Write-HOST $S3BucketName
+            Write-HOST $S3CUName
+             if (($backuprequired -eq 'BackupRequired') -and ([string]::IsNullOrWhiteSpace($backuplocation)))
+            {
+            Write-Host " Selected Backup required and Backup location not provided. Please provide location to take full backup"
+            Throw
+            } 
+
+            $cred = New-Object System.Management.Automation.PSCredential ($SQLUsername, $SQLpassword) 
+            #Get-Credential -Credential $Cred
+            #Create a new PowerShell session in the security context of the alternate user, using the PSCredential object we just created            
+            $RunasDifferentUser= New-PSSession  -Credential $cred ; 
+            Invoke-Command -Session $RunasDifferentUser -Script {
+            # Write-Log $env:userdomain\$env:username
+            function Write-Log
+            {
+            PARAM
+            (
+            [Parameter(Mandatory = $true)] [string] $Message
+            ,[ValidateSet("Green", "Yellow", "Red")] [string] $Color
+            )
+            $Datestamp = [datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss.fff')
+            $CompleteMessage = "$Datestamp $Message"
+            if($Color)
+            {
+            Write-Host $CompleteMessage -ForegroundColor $Color
+            }
+            else
+            {
+            Write-Host $CompleteMessage
+            }
+            Write-Output $CompleteMessage | out-file -encoding ASCII $LogFile -Append
+            }
+            $DestinationDriveFolder="C:\Windows\temp"
+            $LogFile = $DestinationDriveFolder + "\Logfile.txt"
+
+            if (Test-Path $LogFile)
+            {
+            Remove-Item -Path $LogFile
+            New-Item -path $LogFile
+            Write-Log "New Log File Created"
+            }
+            $pendingRebootTests = @(
+            @{
+            Name = 'RebootPending'
+            Test = { Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing'  -Name 'RebootPending' -ErrorAction Ignore }
+            TestType = 'ValueExists'
+            }
+            @{
+            Name = 'RebootRequired'
+            Test = { Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update'  -Name 'RebootRequired' -ErrorAction Ignore }
+            TestType = 'ValueExists'
+            }
+            @{
+            Name = 'PendingFileRenameOperations'
+            Test = { Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -ErrorAction Ignore }
+            TestType = 'NonNullValue'
+            }
+            )
+            foreach ($test in $pendingRebootTests) {
+            $result = Invoke-Command -ScriptBlock $test.Test
+            if ($test.TestType -eq 'ValueExists' -and $result) {
+            Write-log "Reboot Required, restart after rebooting server"
+            Throw
+            } elseif ($test.TestType -eq 'NonNullValue' -and $result -and $result.($test.Name)) {
+            Write-log "Reboot Required, restatt after rebooting server"
+            Throw
+            } else {
+            Write-log "No pending Reboot, proceeding with next check"
+            }
+            }
+            $TotalInstanceServices=Get-Service | Where-Object {$_.DisplayName -like "SQL Server (*"} 
+            If ($TotalInstanceServices.Count -gt 1)
+            {
+            Write-Log "Multiple SQL Instances are Installed on this Server.Not supported at this time" -Color Red
+            Throw
+            }
+            elseif ($TotalInstanceServices.Count -eq 0)
+            {
+            Write-Log "SQL is not installed on this machine" -Color Red
+            Throw
+            }
+            $InstanceService= $TotalInstanceServices.Name
+                    
+            #Check Whether SQL2014 is installed or not
+            $InstanceName= (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server').InstalledInstances
+            $InstanceID=Get-ItemPropertyValue -Path 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL' -Name $InstanceName
+            $Version = Get-ItemPropertyValue -Path "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\${InstanceID}\Setup" -Name 'Version'
+            $Port=Get-ItemPropertyValue -Path "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\${InstanceID}\MSSQLServer\SuperSocketNetLib\Tcp\IPAll" -Name "TcpPort"
+            $versionnumber=$version.substring(0,2)
+            Write-Log "SQL Version ${versionnumber}"
+            if ($versionnumber -eq 12)
+            {
+            Write-Log "SQL 2014 is installed, checking sql instance status" -color Green
+            }
+            else
+            {
+            Write-Log "SQL 2014 is not installed" -color Red
+            Throw
+            } 
+
+
+            #Get Current Time Stamp
+            #Check If SQL Server is Running or not
+            $status =get-service $InstanceService | select Status
+            #Get SQL Server Instance Name
+            If ($InstanceName -eq 'MSSQLSERVER')
+            {
+            $SQLInstanceName ="."
+            Write-Log $InstanceName
+            }
+            else 
+            {
+            $SQLInstancenName="localhost\"+$InstanceName+','+ $Port
+            Write-Log $SQLInstanceName
+            }
+            If($status.Status -eq "Running")
+            {
+            Write-Log "SQLServer is Running"
+            #Check If SQL Server is Clustered or not
+            [array]$Clustered = Invoke-Sqlcmd -ServerInstance $SQLInstancenName -Query "select  SERVERPROPERTY('IsClustered') as IsClustered,SERVERPROPERTY('IsHadrEnabled') as IsHadrEnabled"  #-Credential $Cred
+            if($Clustered.isClustered -eq 1 -or $Clustered.IsHadrEnabled -eq 1)
+            {
+            Write-Log "SQL is clustered or Part of Always on Availability Groups. Use rolling upgrade method" -Color Red
+            Throw
+            }
+            }
+            else
+            {
+            Write-Log "SQLServer is not Running"
+            Throw
+            }
+            $DiskSize=Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'"| Select-Object Size,FreeSpace
+            if($DiskSize.FreeSpace/1GB -gt 4)
+            {
+            Write-Log "Enough Space to download SQL Media on C drive" -Color Green
+            }
+            else
+            {
+            Write-Log "Not Enough Space to download SQL Media on C drive" -Color Red
+            Throw
+            }
+            Write-Log "Starting SQL Binaries Download"
+            $SQLInstallationFolder="C:\SQL" + "_" + $using:timeStamp + "\" + $using:sqlversion
+            Write-Log $SQLInstallationFolder
+            New-Item -ItemType directory $SQLInstallationFolder 
+            Read-S3Object -BucketName $using:S3BucketName -KeyPrefix $using:sqlversion -Folder $SQLInstallationFolder
+
+
+             
+             $InstallPath = $SQLInstallationFolder
+
+
+            $path="${InstallPath}\MediaInfo.xml"
+            [xml]$xmlcontent= Get-content $Path
+            $baseversion=$xmlcontent.MediaInfo.Properties.Property | Where-Object { $_.ID -eq 'BaselineVersion' }
+            $binversionnumber= ($baseversion.Value).Substring(0,2)
+            Write-Host "Downloaded binaries version ${binversionnumber}"
+            if ($using:sqlversion -eq 'sql2016')
+            {
+            $selectedversionnumber='13'
+            }
+            elseif ($using:sqlversion -eq 'sql2017'){
+            $selectedversionnumber='14'
+            }
+            elseif ($using:sqlversion -eq 'sql2019'){
+            $selectedversionnumber='15'
+            }
+            elseif ($using:sqlversion -eq 'sql2022'){
+            $selectedversionnumber='16'
+            }
+
+            if ($selectedversionnumber -eq $binversionnumber)
+            {
+            Write-Host "Downloaded binaries matches selected version"
+            }
+            else{
+            Write-Host "Downloaded binaries doesnt match selected version"
+            Throw
+            }
+
+
+
+             Write-Log "SQL Upgrade Binary Location ${InstallPath}"
+             $upgradeaction="/ACTION=""Upgrade"" /Q /UpdateEnabled=FALSE /IAcceptSqlServerLicenseTerms /INSTANCENAME=${InstanceName}" 
+
+             Write-Log "Sql upgrade action ${upgradeaction}"
+             
+             #GET DB File Location (we are getting this info ,Uninstalling SQL will not remove tempdb files if they are in custom location)
+             [array]$TempDBFileLocation = Invoke-Sqlcmd -ServerInstance $SQLInstancenName -Query "USE tempdb;
+                                     SELECT 
+                                    physical_name
+                                    FROM sys.database_files;" 
+             $TempDBFileLocation.physical_name
+             #User Database File location
+             $userdbnames=Invoke-Sqlcmd -ServerInstance $SQLInstancenName -Query "SELECT 
+                         DataFile.database_id, 
+                         DataFile.name, 
+                         DataFile.physical_name as DataFile, 
+                         LogFile.physical_name as LogFile
+                        FROM (SELECT * FROM sys.master_files WHERE type_desc = 'ROWS' ) DataFile
+                     JOIN (SELECT * FROM sys.master_files WHERE type_desc = 'LOG' ) LogFile
+                     ON DataFile.database_id = LogFile.database_id
+                     where DataFile.database_id>4;" 
+
+             #Get list of all Databases and backup them
+
+             # New-Item -Path $backuplocation\$timeStamp -ItemType Directory 
+             # $backupdevice=$backuplocation+"\"+ $backupfolder.Name
+             #GET DB File Location (we are getting this info ,Uninstalling SQL will not remove tempdb files if they are in custom location)
+             [array]$TempDBFileLocation = Invoke-Sqlcmd -ServerInstance $SQLInstancenName -Query "USE tempdb;
+                                     SELECT 
+                                    physical_name
+                                     FROM sys.database_files;" 
+             $TempDBFileLocation.physical_name
+             #User Database File location
+             $userdbfilepath='C:\Windows\Temp'+'\userdatabase_path.csv'
+             $SQLPathCOMMAND="SET NOCOUNT ON 
+             DECLARE     @cmd        VARCHAR(MAX),
+             @dbname     VARCHAR(200),
+             @prevdbname VARCHAR(200)
+             SELECT @cmd = '', @dbname = ';', @prevdbname = ''
+             CREATE TABLE #Attach
+             (Seq        INT IDENTITY(1,1) PRIMARY KEY,
+             dbname     SYSNAME NULL,
+             fileid     INT NULL,
+             filename   VARCHAR(1000) NULL,
+             TxtAttach  VARCHAR(MAX) NULL
+             )
+             INSERT INTO #Attach
+             SELECT DISTINCT DB_NAME(dbid) AS dbname, fileid, filename, CONVERT(VARCHAR(MAX),'') AS TxtAttach
+             FROM master.dbo.sysaltfiles
+             WHERE dbid IN (SELECT dbid FROM master.dbo.sysaltfiles )
+             AND DATABASEPROPERTYEX( DB_NAME(dbid) , 'Status' ) = 'ONLINE'
+             AND DB_NAME(dbid) NOT IN ('master','tempdb','msdb','model')
+             ORDER BY dbname, fileid, filename
+             UPDATE #Attach
+             SET @cmd = TxtAttach =  
+             CASE WHEN dbname <> @prevdbname 
+             THEN CONVERT(VARCHAR(200),'exec sp_attach_db @dbname = N''' + dbname + '''')
+             ELSE @cmd
+             END +',@filename' + CONVERT(VARCHAR(10),fileid) + '=N''' + filename +'''',
+             @prevdbname = CASE WHEN dbname <> @prevdbname THEN dbname ELSE @prevdbname END,
+             @dbname = dbname
+             FROM #Attach  WITH (INDEX(0),TABLOCKX)
+             OPTION (MAXDOP 1)
+             SELECT dbname,TxtAttach
+             from
+             (SELECT dbname, MAX(TxtAttach) AS TxtAttach FROM #Attach 
+             GROUP BY dbname) AS x
+             DROP TABLE #Attach
+             GO"
+             $userdbpathoutput=invoke-sqlcmd -ServerInstance "." -query $SQLPathCOMMAND | Export-Csv -Path $userdbfilepath -NoTypeInformation
+             $GetDBNames = Get-SqlDatabase -ServerInstance $SQLInstanceName | Where { $_.Name -ne 'tempdb' }
+             $dbnames= $GetDBNames.Name
+
+             if ($using:backuprequired -eq 'BackupRequired') 
+             {
+             Write-Log "Backup required option selected, will proceed with backup" -Color Green
+             Write-Log $using:backuplocation
+             Write-Log $using:timestamp
+             $backupfolder = $using:backuplocation + "\" + $using:timeStamp
+             Write-Log $backupfolder    
+             if (Test-Path $backupfolder)
+             {
+             Write-Log "Folder Already Exists"
+             }
+             else
+             {
+             New-Item -path $backupfolder -ItemType Directory 
+             Write-Log "Backup Folder Created"
+             }
+             Foreach ($Db in $dbnames)
+
+             {
+             try
+             {
+             Write-log "Backup Started for $Db" -Color Green   
+             $backupFullPath=$backupfolder + "\" + $Db + "_" + $using:timeStamp + ".bak"
+             Backup-SqlDatabase -ServerInstance $SQLInstanceName -Database $Db -BackupFile $backupFullPath
+             Write-log "Backup Finished for $Db" -Color Green       
+             }
+             Catch
+             {
+             Write-log "Backup Failed for $Db"   -Color Red
+             write-log ($Error[0].Exception)
+             Throw
+             }
+             } 
+             }
+             else 
+             {
+             Write-Log "Backup is not required"
+
+             }
+             
+            $systemfiles=Invoke-sqlcmd -ServerInstance $SQLInstancenName -Query "select filename from sysaltfiles where dbid in (1,4)" 
+            $ServiceName=(Get-Service | Where-Object {$_.DisplayName -like "SQL Server (*"}).Name 
+            $files=$systemfiles.filename
+            # Write-Log $files
+            Write-Log $ServiceName
+            Stop-Service $ServiceName -Force
+            Write-Log "SQL Service has been stopped" -Color Green
+
+            foreach ($file in $files)
+            {
+            Copy-Item -Path "${file}" -Destination 'C:\Windows\Temp\'
+            Write-Log "$file copied"
+
+            } 
+
+             
+
+             Write-Log "SQL Service has been stopped" -Color Green
+             Write-log "SQL Upgrade Started"   -Color Green
+             
+             $Path = $InstallPath
+             try{
+             Start-Process -WorkingDirectory $Path -FilePath "setup.exe"  $upgradeaction -Verb runAs -Wait
+             }
+             catch
+             {
+             Write-Log "Upgrade terminated" -Color Red
+             }
+
+
+             if ($using:sqlversion -eq'sql2016')
+             {
+                $SQLErrorLogFile= 'C:\Program Files\Microsoft SQL Server\130\Setup Bootstrap\Log'
+                
+             }
+             elseif ($using:sqlversion -eq'sql2017')
+             {
+              $SQLErrorLogFile= 'C:\Program Files\Microsoft SQL Server\140\Setup Bootstrap\Log'
+             }
+             elseif ($using:sqlversion -eq 'sql2019')
+             {
+              $SQLErrorLogFile= 'C:\Program Files\Microsoft SQL Server\150\Setup Bootstrap\Log'
+              }
+             elseif ($using:sqlversion -eq 'sql2022')
+             {
+              $SQLErrorLogFile= 'C:\Program Files\Microsoft SQL Server\160\Setup Bootstrap\Log'
+             }
+              
+             $SQLErrorLogFileLocation = $SQLErrorLogFile + "\Summary.txt"
+
+             if (Test-Path $SQLErrorLogFileLocation -PathType Leaf)
+             {
+
+             Write-Log "SQL Server Upgrade done, checking for status" -Color Green
+             $CheckStatus = Select-String -Path $SQLErrorLogFileLocation -Pattern "Requested action:              Upgrade"
+             $finalresult = Select-String -Path $SQLErrorLogFileLocation -Pattern "Final result:                  Passed"
+             if (([string]::IsNullOrWhiteSpace($CheckStatus)) -or ([string]::IsNullOrWhiteSpace($finalresult)) ) 
+             {
+             Write-Log "SQL Upgrade Failed, please check logs"   -Color Red
+             Throw
+             }
+             else
+             {
+             Write-Log "SQL Server Upgrade completed succesfully" -Color Green
+             }
+             }
+             else
+             {
+             Write-Log "SQL Server Upgrade not started, please validate logs" -Color Red
+             Throw
+             } 
+
+             #######Check for Reboot Requirement
+             $CheckReboot = Select-String -Path $SQLErrorLogFileLocation -Pattern "Passed but reboot required, see logs for details"
+             if ([string]::IsNullOrWhiteSpace($CheckReboot)) 
+             {
+             Write-log "No reboot required "   -Color Green
+             }
+             else 
+             {
+             Write-log "Reboot Required before Installation"   -Color Red
+             EXIT 3010
+
+             }
+             }
