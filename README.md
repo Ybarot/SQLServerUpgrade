@@ -2,7 +2,7 @@ This script can help you create Custom SSM document.
 
 Here are the input parameters for the custom document. 
 
-InstanceId: Target EC2 instance on which SQL Server edition downgrade is required. We can select this using an interactive instance picker from all the instances managed by Systems Manager.
+InstanceId: Target EC2 instance on which SQL Server edition upgrade is required. We can select this using an interactive instance picker from all the instances managed by Systems Manager.
 Sqlversion: New version to which SQL Server needs to be upgraded. Permitted values are sql2016, sql2017, sql2019 and sql2022
 Backuprequired: Specify whether backup to be taken as part of this automation. Permitted values are Backuprequired and Nobackup
 BackupLocation: If you opt in for backup to be taken as part of this automation, specify the location to store backups of databases e.g. D:\MSSQL\Backup.
